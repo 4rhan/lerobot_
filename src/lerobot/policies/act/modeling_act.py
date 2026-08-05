@@ -19,17 +19,23 @@ As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https
 The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
 """
 
+
+import torch
+import torchvision
 import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from typing import Optional, Tuple, Union
 
 import einops
+from einops import rearrange
 import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: N812
+import torch.nn.functional as F
 import torchvision
 from torch import Tensor, nn
+from torch.nn.modules.utils import _pair as to_2tuple
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
@@ -37,7 +43,54 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
+# =====================================================================
+# ---> ADDED: OFFICIAL PLUCKER EMBEDDER CLASS
+# =====================================================================
+class PluckerEmbedder(nn.Module):
+    """Convert rays to plucker embedding (Official Implementation)"""
+    def __init__(self, patch_size: int = 1, device: Optional[torch.device] = 'cpu'):
+        super().__init__()
+        self.device = device
+        self.patch_size = to_2tuple(patch_size)
 
+    def forward(self, intrinsics: Tensor, camtoworlds: Tensor, image_size: Tuple[int, int]) -> Tensor:
+        assert intrinsics.shape[-2:] == (3, 3), "intrinsics should be (B, 3, 3)"
+        assert camtoworlds.shape[-2:] == (4, 4), "camtoworlds should be (B, 4, 4)"
+        intrinsics_shape = intrinsics.shape
+        intrinsics = intrinsics.reshape(-1, 3, 3)
+        camtoworlds = camtoworlds.reshape(-1, 4, 4)
+        
+        grid_size = tuple([s // p for s, p in zip(image_size, self.patch_size)])
+
+        x, y = torch.meshgrid(
+            torch.arange(grid_size[1], device=intrinsics.device),
+            torch.arange(grid_size[0], device=intrinsics.device),
+            indexing="xy",
+        )
+        x = x.float().reshape(1, -1) + 0.5
+        y = y.float().reshape(1, -1) + 0.5
+        x = x.repeat(intrinsics.size(0), 1)
+        y = y.repeat(intrinsics.size(0), 1)
+        
+        camera_dirs = torch.nn.functional.pad(
+            torch.stack([
+                (x - intrinsics[:, 0, 2][..., None]) / intrinsics[:, 0, 0][..., None],
+                (y - intrinsics[:, 1, 2][..., None]) / intrinsics[:, 1, 1][..., None],
+            ], dim=-1),
+            (0, 1),
+            value=1.0,
+        )
+
+        directions = torch.sum(camera_dirs[:, :, None, :] * camtoworlds[:, None, :3, :3], dim=-1)
+        origins = torch.broadcast_to(camtoworlds[:, :3, -1].unsqueeze(1), directions.shape)
+        direction_norm = torch.linalg.norm(directions, dim=-1, keepdims=True)
+        viewdirs = directions / (direction_norm + 1e-8)
+        
+        cross_prod = torch.cross(origins, viewdirs, dim=-1)
+        plucker = torch.cat((cross_prod, viewdirs), dim=-1)
+        plucker = rearrange(plucker, "b (h w) c -> b h w c", h=grid_size[0])
+        
+        return {"plucker": plucker.view(*intrinsics_shape[:-2], *grid_size, 6)}
 
 class ACTPolicy(PreTrainedPolicy):
     """
@@ -87,7 +140,7 @@ class ACTPolicy(PreTrainedPolicy):
                     if n.startswith("model.backbone") and p.requires_grad
                 ],
                 "lr": self.config.optimizer_lr_backbone,
-            },
+            }
         ]
 
     def reset(self):
@@ -328,6 +381,24 @@ class ACT(nn.Module):
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
+            self.plucker_embedder = PluckerEmbedder()
+            
+            old_conv = backbone_model.conv1
+            new_conv = nn.Conv2d(
+                in_channels=9,  # 3 RGB + 6 Plucker
+                out_channels=old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias
+            )
+            # Zero-Initialized Early Fusion (keeps pretrained RGB weights safe)
+            with torch.no_grad():
+                new_conv.weight[:, :3, :, :] = old_conv.weight
+                new_conv.weight[:, 3:, :, :] = 0.0
+            backbone_model.conv1 = new_conv
+            # =====================================================================
+            
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
@@ -471,8 +542,31 @@ class ACT(nn.Module):
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
-            for img in batch[OBS_IMAGES]:
-                cam_features = self.backbone(img)["feature_map"]
+            
+            for i, img_key in enumerate(self.config.image_features):
+                img = batch[OBS_IMAGES][i]  # (B, 3, H, W)
+                B, C, H, W = img.shape
+                
+                cam_name = img_key.split('.')[-1]
+                ext_key = f"observation.extrinsics.{cam_name}"
+                int_key = f"observation.intrinsics.{cam_name}"
+                
+                if ext_key in batch and int_key in batch:
+                    c2w = batch[ext_key]
+                    K = batch[int_key]
+                    # Get embedding: outputs dict with shape (B, H, W, 6)
+                    plucker_dict = self.plucker_embedder(K, c2w, image_size=(H, W))
+                    # Reshape to (B, 6, H, W) for PyTorch convolutions
+                    plucker_map = plucker_dict["plucker"].permute(0, 3, 1, 2)
+                else:
+                    plucker_map = torch.zeros((B, 6, H, W), dtype=img.dtype, device=img.device)
+                
+                # Concatenate to make a 9-channel image
+                img_with_geometry = torch.cat([img, plucker_map], dim=1)
+                
+                # Feed the 9 channels to the hacked ResNet
+                cam_features = self.backbone(img_with_geometry)["feature_map"]
+
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
@@ -737,7 +831,7 @@ class ACTSinusoidalPositionEmbedding2d(nn.Module):
         return pos_embed
 
 
-def get_activation_fn(activation: str) -> Callable:
+def get_activation_fn(activation: str) -> callable:
     """Return an activation function given a string."""
     if activation == "relu":
         return F.relu

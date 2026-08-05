@@ -13,9 +13,9 @@
 # limitations under the License.
 
 """
-Records a dataset via teleoperation.  This is a pure data-collection
-tool — no policy inference.  For deploying trained policies, use
-``lerobot-rollout`` instead.
+Records a dataset via teleoperation, with an added step that estimates the
+camera's extrinsics (pose relative to an AprilTag) and stores both the
+extrinsics (4x4 c2w) and intrinsics (3x3 K) alongside every frame.
 
 Requires: pip install 'lerobot[core_scripts]'  (includes dataset + hardware + viz extras)
 
@@ -38,61 +38,19 @@ lerobot-record \\
     --display_data=true
 ```
 
-To stream the data to Foxglove instead of Rerun, add ``--display_mode=foxglove`` (then connect the
-Foxglove app to ``ws://127.0.0.1:8765``; override the port with ``--display_port=<port>``).
-
-Example recording with bimanual so100:
-```shell
-lerobot-record \\
-  --robot.type=bi_so_follower \\
-  --robot.left_arm_config.port=/dev/tty.usbmodem5A460822851 \\
-  --robot.right_arm_config.port=/dev/tty.usbmodem5A460814411 \\
-  --robot.id=bimanual_follower \\
-  --robot.left_arm_config.cameras='{
-    wrist: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
-    top: {"type": "opencv", "index_or_path": 3, "width": 640, "height": 480, "fps": 30},
-  }' --robot.right_arm_config.cameras='{
-    wrist: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
-    front: {"type": "opencv", "index_or_path": 4, "width": 640, "height": 480, "fps": 30},
-  }' \\
-  --teleop.type=bi_so_leader \\
-  --teleop.left_arm_config.port=/dev/tty.usbmodem5A460852721 \\
-  --teleop.right_arm_config.port=/dev/tty.usbmodem5A460819811 \\
-  --teleop.id=bimanual_leader \\
-  --display_data=true \\
-  --dataset.repo_id=${HF_USER}/bimanual-so-handover-cube \\
-  --dataset.num_episodes=25 \\
-  --dataset.single_task="Grab and handover the red cube to the other arm" \\
-  --dataset.streaming_encoding=true \\
-  --dataset.encoder_threads=2
-```
-
-Example recording with custom video encoding parameters:
-```shell
-lerobot-record \\
-    --robot.type=so100_follower \\
-    --robot.port=/dev/tty.usbmodem58760431541 \\
-    --robot.cameras="{laptop: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \\
-    --robot.id=black \\
-    --teleop.type=so100_leader \\
-    --teleop.port=/dev/tty.usbmodem58760431551 \\
-    --teleop.id=blue \\
-    --dataset.repo_id=<my_username>/<my_dataset_name> \\
-    --dataset.num_episodes=2 \\
-    --dataset.single_task="Grab the cube" \\
-    --dataset.streaming_encoding=true \\
-    --dataset.encoder_threads=2 \\
-    --dataset.rgb_encoder.vcodec=h264 \\
-    --dataset.rgb_encoder.preset=fast \\
-    --dataset.rgb_encoder.extra_options={"tune": "film", "profile:v": "high", "bf": 2} \\
-    --display_data=true
-```
+IMPORTANT: the camera you want extrinsics/intrinsics for must be named
+"laptop" in --robot.cameras, since that key is hardcoded below. If you use a
+different camera name, update CAMERA_NAME accordingly.
 """
 
 import logging
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
+
+import cv2
+import numpy as np
+import torch
 
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
@@ -166,27 +124,111 @@ from lerobot.utils.visualization_utils import (
     shutdown_visualization,
 )
 
+# --- AprilTag extrinsics/intrinsics config -----------------------------
+CAMERA_NAME = "front"          # must match the key in --robot.cameras
+TAG_SIZE_M = 0.052              # measure your PRINTED tag's black square with a ruler (meters)
+
+# From cv2.calibrateCamera (RMS reprojection error: 3.49 — noticeably high,
+# fx/fy asymmetry suggests the corner detections weren't clean. Recalibrate
+# with a steadier/more varied capture when you get the chance for better
+# extrinsics accuracy).
+K_MATRIX = np.array(
+    [
+        [229.3946, 0.0, 305.9041],
+        [0.0, 202.3217, 226.9424],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
+
+
+def detect_apriltag_and_get_c2w(image, K: np.ndarray, tag_size: float) -> np.ndarray:
+    """
+    Detects an AprilTag (36h11) in an image and returns the camera-to-world (c2w) matrix.
+    """
+    # 1. BULLETPROOF TENSOR CONVERSION
+    if isinstance(image, torch.Tensor):
+        arr = image.detach().cpu().numpy()
+    else:
+        arr = np.asarray(image)
+
+    if arr.ndim != 3:
+        raise ValueError(f"Expected a 3D image array, got shape {arr.shape}")
+
+    # Detect the layout instead of assuming CHW. Raw obs from robot.get_observation() is
+    # typically (H, W, C) straight from the camera (OpenCVCamera returns HWC uint8);
+    # dataset-loaded frames are (C, H, W). Assuming the wrong one silently scrambles the
+    # image via permute() and detection fails on every frame with no error raised.
+    if arr.shape[0] in (1, 3, 4) and arr.shape[0] != arr.shape[-1]:
+        img_np = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
+    else:
+        img_np = arr  # already HWC
+
+    # Normalize to uint8 regardless of source dtype/range
+    if img_np.dtype != np.uint8:
+        if np.issubdtype(img_np.dtype, np.floating) and img_np.max() <= 1.0 + 1e-3:
+            img_np = (img_np * 255.0).clip(0, 255).astype(np.uint8)
+        else:
+            img_np = img_np.clip(0, 255).astype(np.uint8)
+
+    # Ensure memory is contiguous for OpenCV
+    img_np = np.ascontiguousarray(img_np)
+
+    # Check if LeRobot passed RGB or BGR (LeRobot defaults to RGB)
+    # Convert to Grayscale
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+    # --- DEBUG STEP: Save exactly what OpenCV sees to your hard drive! ---
+    # (It will just overwrite this same file every frame so it doesn't fill your drive)
+    cv2.imwrite("debug_lerobot_vision.jpg", gray)
+    # ----------------------------------------------------------------------
+
+    # 2. RUN OPENCV 4.7+ DETECTOR
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    parameters = cv2.aruco.DetectorParameters()
+    # Default minMarkerPerimeterRate (~0.03) rejects tags that look small relative to the
+    # frame — easy to hit at 640x480 when the tag is far from the camera. Lower it so
+    # smaller/farther tags aren't dropped outright. If you get false positives on noise,
+    # raise this back up a bit.
+    parameters.minMarkerPerimeterRate = 0.01
+    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+
+    corners, ids, _rejected = detector.detectMarkers(gray)
+
+    c2w = np.eye(4, dtype=np.float32)
+
+    # 3. DO THE MATH IF FOUND
+    if ids is not None and len(ids) > 0:
+        half_size = tag_size / 2.0
+        obj_points = np.array([
+            [-half_size, half_size, 0],
+            [half_size, half_size, 0],
+            [half_size, -half_size, 0],
+            [-half_size, -half_size, 0],
+        ], dtype=np.float32)
+
+        dist_coeffs = np.zeros((4, 1))
+        success, rvec, tvec = cv2.solvePnP(obj_points, corners[0][0], K, dist_coeffs)
+
+        if success:
+            R, _ = cv2.Rodrigues(rvec)
+            c2w[:3, :3] = R
+            c2w[:3, 3] = tvec.flatten()
+
+    return c2w
+
 
 @dataclass
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
-    # Teleoperator to control the robot (required)
     teleop: TeleoperatorConfig | None = None
-    # Display all cameras on screen
     display_data: bool = False
-    # Visualization backend used when display_data is True: "rerun" or "foxglove".
     display_mode: str = "rerun"
-    # For "rerun": IP of a remote server to send to. For "foxglove": interface to bind the WebSocket
-    # server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces).
     display_ip: str | None = None
-    # For "rerun": port of the remote server. For "foxglove": port to bind the WebSocket server to.
     display_port: int | None = None
-    # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
-    # Use vocal synthesis to read events.
     play_sounds: bool = True
-    # Resume recording on an existing dataset.
     resume: bool = False
 
     def __post_init__(self):
@@ -198,46 +240,14 @@ class RecordConfig:
             )
 
 
-""" --------------- record_loop() data flow --------------------------
-       [ Robot ]
-           V
-     [ robot.get_observation() ] ---> raw_obs
-           V
-     [ robot_observation_processor ] ---> processed_obs
-           V
-     [ Teleoperator ]
-     |
-     |  [teleop.get_action] -> raw_action
-     |          |
-     |          V
-     | [teleop_action_processor]
-     |          |
-     '---> processed_teleop_action
-                               V
-                  [ robot_action_processor ] --> robot_action_to_send
-                               V
-                    [ robot.send_action() ] -- (Robot Executes)
-                               V
-                    ( Save to Dataset )
-                               V
-                  ( Rerun Log / Loop Wait )
-"""
-
-
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
     events: dict,
     fps: int,
-    teleop_action_processor: RobotProcessorPipeline[
-        tuple[RobotAction, RobotObservation], RobotAction
-    ],  # runs after teleop
-    robot_action_processor: RobotProcessorPipeline[
-        tuple[RobotAction, RobotObservation], RobotAction
-    ],  # runs before robot
-    robot_observation_processor: RobotProcessorPipeline[
-        RobotObservation, RobotObservation
-    ],  # runs after robot
+    teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
     control_time_s: int | None = None,
@@ -268,17 +278,26 @@ def record_loop(
             ),
             None,
         )
-
         if not (teleop_arm and teleop_keyboard and len(teleop) == 2 and robot.name == "lekiwi_client"):
             raise ValueError(
-                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
+                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm "
+                "teleoperator. Currently only supported for LeKiwi robot."
             )
 
     control_interval = 1 / fps
-
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
+
+    # Raw obs dicts from robot.get_observation() key cameras by their bare name
+    # (e.g. "front"), NOT the "observation.images.<name>" dataset-schema prefix —
+    # that prefix only gets applied later by build_dataset_frame. Using the wrong
+    # key here means detect_apriltag_and_get_c2w silently never runs.
+    obs_image_key = CAMERA_NAME
+    extrinsics_key = f"observation.extrinsics.{CAMERA_NAME}"
+    intrinsics_key = f"observation.intrinsics.{CAMERA_NAME}"
+    warned_missing_camera_key = False
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -289,23 +308,38 @@ def record_loop(
         # Get robot observation
         obs = robot.get_observation()
 
+        # Estimate camera pose (extrinsics) from the AprilTag, if visible
+        if obs_image_key in obs:
+            c2w_matrix = detect_apriltag_and_get_c2w(obs[obs_image_key], K_MATRIX, tag_size=TAG_SIZE_M)
+        else:
+            if not warned_missing_camera_key:
+                logging.warning(
+                    f"'{obs_image_key}' not found in raw observation dict — extrinsics/intrinsics "
+                    f"will be saved as identity for this whole episode. Actual obs keys: {list(obs.keys())}"
+                )
+                warned_missing_camera_key = True
+            c2w_matrix = np.eye(4, dtype=np.float32)
+
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
         if dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            # build_dataset_frame only knows about the robot's native features, so it won't
+            # pick up our custom extrinsics/intrinsics keys no matter where we stash them in
+            # obs/obs_processed. Add them straight into the frame dict instead — this is what
+            # actually gets validated against dataset.features and written to disk.
+            observation_frame[extrinsics_key] = torch.from_numpy(c2w_matrix)
+            observation_frame[intrinsics_key] = torch.from_numpy(K_MATRIX)
 
         # Get action from teleop
         if isinstance(teleop, Teleoperator):
             act = teleop.get_action()
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
-
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-
         elif isinstance(teleop, list):
             arm_action = teleop_arm.get_action()
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
@@ -325,13 +359,8 @@ def record_loop(
                 )
             continue
 
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        # Write to dataset
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
@@ -346,15 +375,13 @@ def record_loop(
             )
 
         dt_s = time.perf_counter() - start_loop_t
-
         sleep_time_s: float = control_interval - dt_s
         if sleep_time_s < 0:
             logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). "
+                f"Dataset frames might be dropped and robot control might be unstable."
             )
-
         precise_sleep(max(sleep_time_s, 0.0))
-
         timestamp = time.perf_counter() - start_episode_t
 
 
@@ -380,7 +407,6 @@ def record(
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
-    # Fall back to identity pipelines when the caller doesn't supply processors.
     if (
         teleop_action_processor is None
         or robot_action_processor is None
@@ -391,12 +417,11 @@ def record(
         robot_action_processor = robot_action_processor or _r
         robot_observation_processor = robot_observation_processor or _o
 
+    # Build the base feature dict first...
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
             pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
+            initial_features=create_initial_features(action=robot.action_features),
             use_videos=cfg.dataset.video,
         ),
         aggregate_pipeline_dataset_features(
@@ -405,6 +430,18 @@ def record(
             use_videos=cfg.dataset.video,
         ),
     )
+
+    # ...then register the extra extrinsics/intrinsics fields added in record_loop.
+    dataset_features[f"observation.extrinsics.{CAMERA_NAME}"] = {
+        "dtype": "float32",
+        "shape": (4, 4),
+        "names": ["row", "col"],
+    }
+    dataset_features[f"observation.intrinsics.{CAMERA_NAME}"] = {
+        "dtype": "float32",
+        "shape": (3, 3),
+        "names": ["row", "col"],
+    }
 
     dataset = None
     listener = None
@@ -428,7 +465,6 @@ def record(
             )
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
-            # Reject eval_ prefix — for policy evaluation use lerobot-rollout
             repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
             if repo_name.startswith("eval_"):
                 raise ValueError(
@@ -461,7 +497,8 @@ def record(
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
-                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.rgb_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
+                "Streaming encoding is disabled. If you have capable hardware, consider enabling it "
+                "for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2"
             )
 
         with VideoEncodingManager(dataset):
@@ -484,13 +521,10 @@ def record(
                     display_compressed_images=display_compressed_images,
                 )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
                 if not events["stop_recording"] and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
-
                     record_loop(
                         robot=robot,
                         events=events,
@@ -516,27 +550,21 @@ def record(
                 recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
-
         if dataset:
             dataset.finalize()
-
         if robot.is_connected:
             robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()
-
         if listener is not None:
             listener.stop()
-
         if cfg.display_data:
             shutdown_visualization(cfg.display_mode)
-
         if cfg.dataset.push_to_hub:
             if dataset and dataset.num_episodes > 0:
                 dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
             else:
                 logging.warning("No episodes saved — skipping push to hub")
-
         log_say("Exiting", cfg.play_sounds)
     return dataset
 
