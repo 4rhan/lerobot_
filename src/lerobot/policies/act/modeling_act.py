@@ -551,15 +551,62 @@ class ACT(nn.Module):
                 ext_key = f"observation.extrinsics.{cam_name}"
                 int_key = f"observation.intrinsics.{cam_name}"
                 
-                if ext_key in batch and int_key in batch:
-                    c2w = batch[ext_key]
-                    K = batch[int_key]
-                    # Get embedding: outputs dict with shape (B, H, W, 6)
-                    plucker_dict = self.plucker_embedder(K, c2w, image_size=(H, W))
-                    # Reshape to (B, 6, H, W) for PyTorch convolutions
-                    plucker_map = plucker_dict["plucker"].permute(0, 3, 1, 2)
-                else:
-                    plucker_map = torch.zeros((B, 6, H, W), dtype=img.dtype, device=img.device)
+                # ==========================================================
+                # ---> LIVE INFERENCE FIX: AUTO-DETECT APRILTAG HERE! <---
+                # ==========================================================
+                if ext_key not in batch or int_key not in batch:
+                    import cv2
+                    import numpy as np
+                    
+                    # 1. Hardcoded parameters (Match your record.py!)
+                    tag_size = 0.052  # <--- MAKE SURE THIS IS YOUR ACTUAL TAG SIZE
+                    K_numpy = np.array([
+                        [229.3946, 0.0, 305.9041],
+                        [0.0, 202.3217, 226.9424],
+                        [0.0, 0.0, 1.0],
+                    ], dtype=np.float32)
+                    
+                    # 2. Extract live image for OpenCV
+                    img_tensor_cpu = img[0].detach().cpu()
+                    if img_tensor_cpu.dtype.is_floating_point:
+                        img_np = (img_tensor_cpu.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    else:
+                        img_np = img_tensor_cpu.permute(1, 2, 0).numpy().astype(np.uint8)
+                    
+                    img_np = np.ascontiguousarray(img_np)
+                    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+                    
+                    # 3. Detect AprilTag
+                    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+                    parameters = cv2.aruco.DetectorParameters()
+                    parameters.minMarkerPerimeterRate = 0.01  # Helps see tag from far away
+                    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+                    corners, ids, _ = detector.detectMarkers(gray)
+                    
+                    # 4. Calculate c2w matrix
+                    c2w_numpy = np.eye(4, dtype=np.float32)
+                    if ids is not None and len(ids) > 0:
+                        half_size = tag_size / 2.0
+                        obj_points = np.array([
+                            [-half_size, half_size, 0], [half_size, half_size, 0],
+                            [half_size, -half_size, 0], [-half_size, -half_size, 0],
+                        ], dtype=np.float32)
+                        success, rvec, tvec = cv2.solvePnP(obj_points, corners[0][0], K_numpy, np.zeros((4, 1)))
+                        if success:
+                            R, _ = cv2.Rodrigues(rvec)
+                            c2w_numpy[:3, :3] = R
+                            c2w_numpy[:3, 3] = tvec.flatten()
+                    
+                    # 5. Inject into batch so the policy can use it
+                    batch[ext_key] = torch.from_numpy(c2w_numpy).unsqueeze(0).to(img.device)
+                    batch[int_key] = torch.from_numpy(K_numpy).unsqueeze(0).to(img.device)
+                # ==========================================================
+
+                # Now the math will ALWAYS work!
+                c2w = batch[ext_key]
+                K = batch[int_key]
+                plucker_dict = self.plucker_embedder(K, c2w, image_size=(H, W))
+                plucker_map = plucker_dict["plucker"].permute(0, 3, 1, 2)
                 
                 # Concatenate to make a 9-channel image
                 img_with_geometry = torch.cat([img, plucker_map], dim=1)
