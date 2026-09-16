@@ -13,9 +13,10 @@
 # limitations under the License.
 
 """
-Records a dataset via teleoperation, with an added step that estimates the
+Records a dataset via teleoperation, with an added step that estimates each
 camera's extrinsics (pose relative to an AprilTag) and stores both the
-extrinsics (4x4 c2w) and intrinsics (3x3 K) alongside every frame.
+extrinsics (4x4 c2w) and intrinsics (3x3 K) alongside every frame, for every
+camera in --robot.cameras.
 
 Requires: pip install 'lerobot[core_scripts]'  (includes dataset + hardware + viz extras)
 
@@ -38,9 +39,11 @@ lerobot-record \\
     --display_data=true
 ```
 
-IMPORTANT: the camera you want extrinsics/intrinsics for must be named
-"laptop" in --robot.cameras, since that key is hardcoded below. If you use a
-different camera name, update CAMERA_NAME accordingly.
+Before recording, run `camera_calibration.py --camera-name <name> ...` for
+each camera named in --robot.cameras so its intrinsics are picked up from
+`<name>_calibration.npz` (see `lerobot.utils.apriltag_pose.load_camera_matrix`).
+Any camera without a calibration file falls back to a shared placeholder K
+with a warning — extrinsics for that camera will be inaccurate.
 """
 
 import logging
@@ -48,7 +51,6 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
-import cv2
 import numpy as np
 import torch
 
@@ -109,6 +111,7 @@ from lerobot.teleoperators import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.teleoperators.keyboard import KeyboardTeleop
+from lerobot.utils.apriltag_pose import TAG_SIZE_M, detect_apriltag_and_get_c2w, load_camera_matrix
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -123,100 +126,6 @@ from lerobot.utils.visualization_utils import (
     log_visualization_data,
     shutdown_visualization,
 )
-
-# --- AprilTag extrinsics/intrinsics config -----------------------------
-CAMERA_NAME = "front"          # must match the key in --robot.cameras
-TAG_SIZE_M = 0.052              # measure your PRINTED tag's black square with a ruler (meters)
-
-# From cv2.calibrateCamera (RMS reprojection error: 3.49 — noticeably high,
-# fx/fy asymmetry suggests the corner detections weren't clean. Recalibrate
-# with a steadier/more varied capture when you get the chance for better
-# extrinsics accuracy).
-K_MATRIX = np.array(
-    [
-        [229.3946, 0.0, 305.9041],
-        [0.0, 202.3217, 226.9424],
-        [0.0, 0.0, 1.0],
-    ],
-    dtype=np.float32,
-)
-
-
-def detect_apriltag_and_get_c2w(image, K: np.ndarray, tag_size: float) -> np.ndarray:
-    """
-    Detects an AprilTag (36h11) in an image and returns the camera-to-world (c2w) matrix.
-    """
-    # 1. BULLETPROOF TENSOR CONVERSION
-    if isinstance(image, torch.Tensor):
-        arr = image.detach().cpu().numpy()
-    else:
-        arr = np.asarray(image)
-
-    if arr.ndim != 3:
-        raise ValueError(f"Expected a 3D image array, got shape {arr.shape}")
-
-    # Detect the layout instead of assuming CHW. Raw obs from robot.get_observation() is
-    # typically (H, W, C) straight from the camera (OpenCVCamera returns HWC uint8);
-    # dataset-loaded frames are (C, H, W). Assuming the wrong one silently scrambles the
-    # image via permute() and detection fails on every frame with no error raised.
-    if arr.shape[0] in (1, 3, 4) and arr.shape[0] != arr.shape[-1]:
-        img_np = np.transpose(arr, (1, 2, 0))  # CHW -> HWC
-    else:
-        img_np = arr  # already HWC
-
-    # Normalize to uint8 regardless of source dtype/range
-    if img_np.dtype != np.uint8:
-        if np.issubdtype(img_np.dtype, np.floating) and img_np.max() <= 1.0 + 1e-3:
-            img_np = (img_np * 255.0).clip(0, 255).astype(np.uint8)
-        else:
-            img_np = img_np.clip(0, 255).astype(np.uint8)
-
-    # Ensure memory is contiguous for OpenCV
-    img_np = np.ascontiguousarray(img_np)
-
-    # Check if LeRobot passed RGB or BGR (LeRobot defaults to RGB)
-    # Convert to Grayscale
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-
-    # --- DEBUG STEP: Save exactly what OpenCV sees to your hard drive! ---
-    # (It will just overwrite this same file every frame so it doesn't fill your drive)
-    cv2.imwrite("debug_lerobot_vision.jpg", gray)
-    # ----------------------------------------------------------------------
-
-    # 2. RUN OPENCV 4.7+ DETECTOR
-    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-    parameters = cv2.aruco.DetectorParameters()
-    # Default minMarkerPerimeterRate (~0.03) rejects tags that look small relative to the
-    # frame — easy to hit at 640x480 when the tag is far from the camera. Lower it so
-    # smaller/farther tags aren't dropped outright. If you get false positives on noise,
-    # raise this back up a bit.
-    parameters.minMarkerPerimeterRate = 0.01
-    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-
-    corners, ids, _rejected = detector.detectMarkers(gray)
-
-    c2w = np.eye(4, dtype=np.float32)
-
-    # 3. DO THE MATH IF FOUND
-    if ids is not None and len(ids) > 0:
-        half_size = tag_size / 2.0
-        obj_points = np.array([
-            [-half_size, half_size, 0],
-            [half_size, half_size, 0],
-            [half_size, -half_size, 0],
-            [-half_size, -half_size, 0],
-        ], dtype=np.float32)
-
-        dist_coeffs = np.zeros((4, 1))
-        success, rvec, tvec = cv2.solvePnP(obj_points, corners[0][0], K, dist_coeffs)
-
-        if success:
-            R, _ = cv2.Rodrigues(rvec)
-            c2w[:3, :3] = R
-            c2w[:3, 3] = tvec.flatten()
-
-    return c2w
-
 
 @dataclass
 class RecordConfig:
@@ -255,6 +164,7 @@ def record_loop(
     display_data: bool = False,
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
+    camera_matrices: dict[str, np.ndarray] | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -291,12 +201,17 @@ def record_loop(
 
     # Raw obs dicts from robot.get_observation() key cameras by their bare name
     # (e.g. "front"), NOT the "observation.images.<name>" dataset-schema prefix —
-    # that prefix only gets applied later by build_dataset_frame. Using the wrong
-    # key here means detect_apriltag_and_get_c2w silently never runs.
-    obs_image_key = CAMERA_NAME
-    extrinsics_key = f"observation.extrinsics.{CAMERA_NAME}"
-    intrinsics_key = f"observation.intrinsics.{CAMERA_NAME}"
-    warned_missing_camera_key = False
+    # that prefix only gets applied later by build_dataset_frame.
+    camera_matrices = camera_matrices or {}
+    warned_missing_camera_keys: set[str] = set()
+
+    # Camera pose is static for the whole episode — per the paper's protocol, a camera only
+    # gets re-posed between episodes, never mid-episode. So detect each camera's AprilTag pose
+    # once (retrying frame-to-frame only until the tag first becomes visible) and reuse that
+    # same c2w for every remaining frame in this episode, instead of re-running detection on
+    # every single frame. AprilTag detection is real per-frame cost (~20ms/camera on top of
+    # everything else in the loop) — this cuts it to effectively once per episode.
+    episode_c2w_matrices: dict[str, np.ndarray] = {}
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -308,17 +223,23 @@ def record_loop(
         # Get robot observation
         obs = robot.get_observation()
 
-        # Estimate camera pose (extrinsics) from the AprilTag, if visible
-        if obs_image_key in obs:
-            c2w_matrix = detect_apriltag_and_get_c2w(obs[obs_image_key], K_MATRIX, tag_size=TAG_SIZE_M)
-        else:
-            if not warned_missing_camera_key:
-                logging.warning(
-                    f"'{obs_image_key}' not found in raw observation dict — extrinsics/intrinsics "
-                    f"will be saved as identity for this whole episode. Actual obs keys: {list(obs.keys())}"
-                )
-                warned_missing_camera_key = True
-            c2w_matrix = np.eye(4, dtype=np.float32)
+        # Skipped entirely when dataset is None (e.g. the "reset environment" phase between
+        # episodes) since nothing is written in that case.
+        if dataset is not None:
+            for cam_name, K in camera_matrices.items():
+                if cam_name in episode_c2w_matrices:
+                    continue  # already locked in for this episode
+                if cam_name in obs:
+                    c2w = detect_apriltag_and_get_c2w(obs[cam_name], K, tag_size=TAG_SIZE_M)
+                    if not np.allclose(c2w, np.eye(4)):
+                        episode_c2w_matrices[cam_name] = c2w
+                    # else: tag not visible in this frame yet — retry on the next frame.
+                elif cam_name not in warned_missing_camera_keys:
+                    logging.warning(
+                        f"'{cam_name}' not found in raw observation dict — extrinsics/intrinsics "
+                        f"will be saved as identity for this camera. Actual obs keys: {list(obs.keys())}"
+                    )
+                    warned_missing_camera_keys.add(cam_name)
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -329,8 +250,10 @@ def record_loop(
             # pick up our custom extrinsics/intrinsics keys no matter where we stash them in
             # obs/obs_processed. Add them straight into the frame dict instead — this is what
             # actually gets validated against dataset.features and written to disk.
-            observation_frame[extrinsics_key] = torch.from_numpy(c2w_matrix)
-            observation_frame[intrinsics_key] = torch.from_numpy(K_MATRIX)
+            for cam_name, K in camera_matrices.items():
+                c2w = episode_c2w_matrices.get(cam_name, np.eye(4, dtype=np.float32))
+                observation_frame[f"observation.extrinsics.{cam_name}"] = torch.from_numpy(c2w)
+                observation_frame[f"observation.intrinsics.{cam_name}"] = torch.from_numpy(K)
 
         # Get action from teleop
         if isinstance(teleop, Teleoperator):
@@ -431,17 +354,21 @@ def record(
         ),
     )
 
-    # ...then register the extra extrinsics/intrinsics fields added in record_loop.
-    dataset_features[f"observation.extrinsics.{CAMERA_NAME}"] = {
-        "dtype": "float32",
-        "shape": (4, 4),
-        "names": ["row", "col"],
-    }
-    dataset_features[f"observation.intrinsics.{CAMERA_NAME}"] = {
-        "dtype": "float32",
-        "shape": (3, 3),
-        "names": ["row", "col"],
-    }
+    # ...then register the extra extrinsics/intrinsics fields added in record_loop, one pair
+    # per configured camera, and load each camera's own calibrated intrinsics (falls back to
+    # a shared placeholder with a warning if `camera_calibration.py` hasn't been run for it).
+    camera_matrices = {cam_name: load_camera_matrix(cam_name) for cam_name in robot.cameras}
+    for cam_name in camera_matrices:
+        dataset_features[f"observation.extrinsics.{cam_name}"] = {
+            "dtype": "float32",
+            "shape": (4, 4),
+            "names": ["row", "col"],
+        }
+        dataset_features[f"observation.intrinsics.{cam_name}"] = {
+            "dtype": "float32",
+            "shape": (3, 3),
+            "names": ["row", "col"],
+        }
 
     dataset = None
     listener = None
@@ -519,6 +446,7 @@ def record(
                     display_data=cfg.display_data,
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
+                    camera_matrices=camera_matrices,
                 )
 
                 if not events["stop_recording"] and (
@@ -544,6 +472,17 @@ def record(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    continue
+
+                if not dataset.has_pending_frames():
+                    # exit_early fired before a single frame was captured for this episode
+                    # (e.g. an early keypress right as recording started) — nothing to save.
+                    # Retry the same episode instead of crashing the whole session on
+                    # `save_episode()` (which requires at least one frame).
+                    logging.warning(
+                        "No frames were captured for this episode (exited before any frame was "
+                        "recorded) — retrying the same episode instead of saving an empty one."
+                    )
                     continue
 
                 dataset.save_episode()

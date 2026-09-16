@@ -78,6 +78,13 @@ class ACTConfig(PreTrainedConfig):
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
+        use_plucker: Camera-conditioning as per "Do You Know Where Your Camera Is?". When True, the vision
+            backbone's first conv layer is widened to take a 9-channel input (3 RGB + 6 Plucker-ray
+            channels) and each camera's per-pixel Plucker ray-map — derived from
+            `observation.extrinsics.<cam>` / `observation.intrinsics.<cam>` — is concatenated to the image
+            before the backbone. Requires a dataset recorded with those extrinsics/intrinsics features
+            (e.g. via `lerobot-record`'s AprilTag-based pose estimation). When False, ACT behaves exactly
+            as the unmodified 3-channel-input policy.
     """
 
     # Input / output structure.
@@ -98,6 +105,8 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # Camera-conditioning as per "Do You Know Where Your Camera Is?".
+    use_plucker: bool = False
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -162,6 +171,8 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.use_plucker and not self.image_features:
+            raise ValueError("`use_plucker` requires at least one image input.")
 
     @property
     def observation_delta_indices(self) -> None:

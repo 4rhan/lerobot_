@@ -381,24 +381,26 @@ class ACT(nn.Module):
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
-            self.plucker_embedder = PluckerEmbedder()
-            
-            old_conv = backbone_model.conv1
-            new_conv = nn.Conv2d(
-                in_channels=9,  # 3 RGB + 6 Plucker
-                out_channels=old_conv.out_channels,
-                kernel_size=old_conv.kernel_size,
-                stride=old_conv.stride,
-                padding=old_conv.padding,
-                bias=old_conv.bias
-            )
-            # Zero-Initialized Early Fusion (keeps pretrained RGB weights safe)
-            with torch.no_grad():
-                new_conv.weight[:, :3, :, :] = old_conv.weight
-                new_conv.weight[:, 3:, :, :] = 0.0
-            backbone_model.conv1 = new_conv
-            # =====================================================================
-            
+
+            if self.config.use_plucker:
+                self.plucker_embedder = PluckerEmbedder()
+
+                old_conv = backbone_model.conv1
+                new_conv = nn.Conv2d(
+                    in_channels=9,  # 3 RGB + 6 Plucker
+                    out_channels=old_conv.out_channels,
+                    kernel_size=old_conv.kernel_size,
+                    stride=old_conv.stride,
+                    padding=old_conv.padding,
+                    bias=old_conv.bias,
+                )
+                # Zero-initialized early fusion: the extra Plucker channels start at zero
+                # contribution so the pretrained RGB backbone weights are unaffected at init.
+                with torch.no_grad():
+                    new_conv.weight[:, :3, :, :] = old_conv.weight
+                    new_conv.weight[:, 3:, :, :] = 0.0
+                backbone_model.conv1 = new_conv
+
             # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
             # feature map).
             # Note: The forward method of this returns a dict: {"feature_map": output}.
@@ -545,74 +547,41 @@ class ACT(nn.Module):
             
             for i, img_key in enumerate(self.config.image_features):
                 img = batch[OBS_IMAGES][i]  # (B, 3, H, W)
-                B, C, H, W = img.shape
-                
-                cam_name = img_key.split('.')[-1]
-                ext_key = f"observation.extrinsics.{cam_name}"
-                int_key = f"observation.intrinsics.{cam_name}"
-                
-                # ==========================================================
-                # ---> LIVE INFERENCE FIX: AUTO-DETECT APRILTAG HERE! <---
-                # ==========================================================
-                if ext_key not in batch or int_key not in batch:
-                    import cv2
-                    import numpy as np
-                    
-                    # 1. Hardcoded parameters (Match your record.py!)
-                    tag_size = 0.052  # <--- MAKE SURE THIS IS YOUR ACTUAL TAG SIZE
-                    K_numpy = np.array([
-                        [229.3946, 0.0, 305.9041],
-                        [0.0, 202.3217, 226.9424],
-                        [0.0, 0.0, 1.0],
-                    ], dtype=np.float32)
-                    
-                    # 2. Extract live image for OpenCV
-                    img_tensor_cpu = img[0].detach().cpu()
-                    if img_tensor_cpu.dtype.is_floating_point:
-                        img_np = (img_tensor_cpu.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-                    else:
-                        img_np = img_tensor_cpu.permute(1, 2, 0).numpy().astype(np.uint8)
-                    
-                    img_np = np.ascontiguousarray(img_np)
-                    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-                    
-                    # 3. Detect AprilTag
-                    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-                    parameters = cv2.aruco.DetectorParameters()
-                    parameters.minMarkerPerimeterRate = 0.01  # Helps see tag from far away
-                    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
-                    corners, ids, _ = detector.detectMarkers(gray)
-                    
-                    # 4. Calculate c2w matrix
-                    c2w_numpy = np.eye(4, dtype=np.float32)
-                    if ids is not None and len(ids) > 0:
-                        half_size = tag_size / 2.0
-                        obj_points = np.array([
-                            [-half_size, half_size, 0], [half_size, half_size, 0],
-                            [half_size, -half_size, 0], [-half_size, -half_size, 0],
-                        ], dtype=np.float32)
-                        success, rvec, tvec = cv2.solvePnP(obj_points, corners[0][0], K_numpy, np.zeros((4, 1)))
-                        if success:
-                            R, _ = cv2.Rodrigues(rvec)
-                            c2w_numpy[:3, :3] = R
-                            c2w_numpy[:3, 3] = tvec.flatten()
-                    
-                    # 5. Inject into batch so the policy can use it
-                    batch[ext_key] = torch.from_numpy(c2w_numpy).unsqueeze(0).to(img.device)
-                    batch[int_key] = torch.from_numpy(K_numpy).unsqueeze(0).to(img.device)
-                # ==========================================================
 
-                # Now the math will ALWAYS work!
-                c2w = batch[ext_key]
-                K = batch[int_key]
-                plucker_dict = self.plucker_embedder(K, c2w, image_size=(H, W))
-                plucker_map = plucker_dict["plucker"].permute(0, 3, 1, 2)
-                
-                # Concatenate to make a 9-channel image
-                img_with_geometry = torch.cat([img, plucker_map], dim=1)
-                
-                # Feed the 9 channels to the hacked ResNet
-                cam_features = self.backbone(img_with_geometry)["feature_map"]
+                if self.config.use_plucker:
+                    _, _, H, W = img.shape
+                    cam_name = img_key.split(".")[-1]
+                    ext_key = f"observation.extrinsics.{cam_name}"
+                    int_key = f"observation.intrinsics.{cam_name}"
+
+                    # Live-inference fallback: a real robot observation (rollout) won't carry
+                    # extrinsics/intrinsics unless something injects them — only a dataset recorded
+                    # via `lerobot-record`'s AprilTag pipeline has them already. Estimate them from
+                    # the current frame instead, using the exact same detection code path as
+                    # recording (lerobot.utils.apriltag_pose) so eval-time geometry matches
+                    # record-time geometry. This only makes sense for single-frame batches (B == 1,
+                    # i.e. rollout) — training batches must already carry these keys from the dataset.
+                    if ext_key not in batch or int_key not in batch:
+                        from lerobot.utils.apriltag_pose import (
+                            TAG_SIZE_M,
+                            detect_apriltag_and_get_c2w,
+                            load_camera_matrix,
+                        )
+
+                        K_numpy = load_camera_matrix(cam_name)
+                        c2w_numpy = detect_apriltag_and_get_c2w(img[0], K_numpy, tag_size=TAG_SIZE_M)
+                        batch[ext_key] = torch.from_numpy(c2w_numpy).unsqueeze(0).to(img.device)
+                        batch[int_key] = torch.from_numpy(K_numpy).unsqueeze(0).to(img.device)
+
+                    c2w = batch[ext_key]
+                    K = batch[int_key]
+                    plucker_dict = self.plucker_embedder(K, c2w, image_size=(H, W))
+                    plucker_map = plucker_dict["plucker"].permute(0, 3, 1, 2)
+
+                    # Concatenate to make a 9-channel image for the widened backbone conv1.
+                    img = torch.cat([img, plucker_map], dim=1)
+
+                cam_features = self.backbone(img)["feature_map"]
 
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
