@@ -1,3 +1,208 @@
+# LeRobot + Camera-Conditioned ACT (Plücker Rays)
+
+> **Branch:** `act_plukcker` · fork of [huggingface/lerobot](https://github.com/huggingface/lerobot)
+
+This branch makes the **ACT** policy *camera-aware*. Following the idea in
+*"Do You Know Where Your Camera Is?"*, every camera image is paired with a
+per-pixel **Plücker ray map** computed from that camera's intrinsics (`K`) and
+extrinsics (camera-to-world pose). The policy then knows *where each pixel is
+looking from* in 3D, which should make it more robust when a camera is moved
+between episodes.
+
+To get those camera poses, `lerobot-record` now detects a printed **AprilTag**
+in the scene and stores each camera's pose and intrinsics alongside every
+recorded frame.
+
+The upstream LeRobot README is kept below, [after this section](#lerobot-upstream-readme).
+
+---
+
+## What's new on this branch
+
+| Area | File(s) | Change |
+|---|---|---|
+| **ACT policy** | `src/lerobot/policies/act/configuration_act.py` | New `use_plucker: bool = False` flag (off by default, so plain ACT is unchanged). |
+| | `src/lerobot/policies/act/modeling_act.py` | `PluckerEmbedder` module; ResNet `conv1` widened from 3 → **9 input channels** (RGB + 6 Plücker), extra channels zero-initialised so the pretrained weights behave as before at the start of training; live AprilTag fallback at inference. |
+| **Recording** | `src/lerobot/scripts/lerobot_record.py` | Adds `observation.extrinsics.<cam>` (4×4) and `observation.intrinsics.<cam>` (3×3) for every camera in `--robot.cameras`. Detects the tag pose once per episode, then reuses it. Episodes with no frames are retried instead of crashing. |
+| **Pose estimation** | `src/lerobot/utils/apriltag_pose.py` | Shared AprilTag (36h11) detection + `solvePnP` (IPPE_SQUARE) → camera-to-world matrix. Recording and inference both use this module, so they compute poses the same way. |
+| **Calibration** | `src/lerobot/cameras/opencv/camera_calibration.py` | Checkerboard intrinsics calibration with outlier-frame rejection, annotated debug images, and headless (terminal) capture mode. Writes `<cam>_calibration.npz`. |
+| **Tools** | `src/lerobot/cameras/opencv/generate_april_tag.py` | Generates a printable AprilTag. |
+| | `src/lerobot/scripts/test_april_tag.py` | Live check: is the tag detected, and how far away is it? |
+| | `src/lerobot/scripts/validate_april_tag.py` | Re-projects the tag + XYZ axes onto a recorded dataset using the saved extrinsics/intrinsics to verify them. |
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Checkerboard<br/>calibration] -->|K per camera| B[front_calibration.npz]
+    T[Printed AprilTag<br/>in the scene] --> R
+    B --> R[lerobot-record]
+    R -->|image + c2w + K<br/>per frame| D[(LeRobotDataset)]
+    D --> P[PluckerEmbedder<br/>6-ch ray map]
+    D --> I[RGB image]
+    P --> C[concat → 9 channels]
+    I --> C
+    C --> BB[ResNet-18<br/>widened conv1] --> ACT[ACT transformer] --> AC[action chunk]
+```
+
+**Plücker embedding.** For each pixel `(u, v)`, the ray direction is
+`d = R · K⁻¹ [u+0.5, v+0.5, 1]ᵀ` (normalised) and the ray origin is the camera
+centre `o`. The 6-channel embedding is `[o × d, d]`. It is concatenated to the
+RGB image before the vision backbone.
+
+**Static camera per episode.** The camera is assumed to stay still during an
+episode and only move between episodes. During recording, the tag is detected on
+each frame until it is first found, and that pose is reused for the rest of the
+episode. This saves about 20 ms per camera per frame.
+
+---
+
+## Workflow
+
+### 0. Install
+
+```bash
+uv sync --locked --extra all
+```
+
+> `lerobot` installs `opencv-python-headless`, so OpenCV has no GUI windows.
+> All tools here work without a GUI: they fall back to terminal prompts and
+> save debug images to disk. If you want live windows, swap in `opencv-python`.
+
+### 1. Print an AprilTag
+
+```bash
+uv run python src/lerobot/cameras/opencv/generate_april_tag.py   # → apriltag_small.png (tag36h11, id 0)
+```
+
+Print it, place it flat in view of every camera, and **measure the black square
+with a ruler**. Set `TAG_SIZE_M` in `src/lerobot/utils/apriltag_pose.py` to that
+value (currently `0.052` m).
+
+### 2. Calibrate each camera's intrinsics
+
+Run once for **each** camera, using the same name you will give it in `--robot.cameras`:
+
+```bash
+uv run python -m lerobot.cameras.opencv.camera_calibration \
+    --camera-name front \
+    --camera-index 0 \
+    --square-size-m 0.025
+```
+
+- Captures ~15 checkerboard shots (9×6 inner corners by default), saving them to `calib_images/front/`.
+- Writes `front_calibration.npz` to the current directory. `lerobot-record` loads it automatically.
+- Aim for RMS reprojection error **< 0.5 px** (< 1.0 is usable). Frames with error above 1 px are dropped and the camera is recalibrated once without them.
+- Re-run on existing images with `--skip-capture`.
+
+> ⚠️ If a camera has no calibration file, a placeholder `K` is used and a
+> warning is logged. Extrinsics for that camera will be **wrong**.
+
+### 3. Sanity-check tag detection
+
+```bash
+uv run python src/lerobot/scripts/test_april_tag.py \
+    --camera-index 0 --camera-name front --tag-size 0.052
+```
+
+Compare the reported distance against a ruler.
+
+### 4. Record a dataset (with extrinsics)
+
+Run `lerobot-record` from the directory that contains `<cam>_calibration.npz`:
+
+```bash
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_follower \
+    --robot.cameras="{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=my_leader \
+    --dataset.repo_id=${HF_USER}/camera_condition_v1 \
+    --dataset.num_episodes=50 \
+    --dataset.single_task="Pick up the cube" \
+    --dataset.streaming_encoding=true \
+    --dataset.encoder_threads=2
+```
+
+Each frame then also contains:
+
+| Key | Shape | Meaning |
+|---|---|---|
+| `observation.extrinsics.front` | `(4, 4)` | camera-to-world (tag frame) pose; identity if the tag was never seen |
+| `observation.intrinsics.front` | `(3, 3)` | calibrated `K` |
+
+Move the camera **between** episodes (not during) to get viewpoint diversity.
+
+### 5. Validate the recorded poses
+
+```bash
+uv run python src/lerobot/scripts/validate_april_tag.py \
+    --repo-id ${HF_USER}/camera_condition_v1 \
+    --camera-name front
+```
+
+This draws the tag outline and XYZ axes back onto the frames, using the saved
+poses. If the overlays line up with the physical tag, the extrinsics are
+correct. In headless mode it saves frames to `validate_april_tag_debug/`.
+
+### 6. Train camera-conditioned ACT
+
+```bash
+lerobot-train \
+    --dataset.repo_id=${HF_USER}/camera_condition_v1 \
+    --policy.type=act \
+    --policy.use_plucker=true \
+    --policy.repo_id=${HF_USER}/act_camera_conditioned \
+    --output_dir=outputs/train/act_camera_condition_v1 \
+    --batch_size=8 \
+    --steps=100000
+```
+
+Without `--policy.use_plucker=true`, this trains standard ACT. That gives you a
+baseline on the same dataset to compare against.
+
+### 7. Run on the robot
+
+```bash
+lerobot-rollout \
+    --strategy.type=base \
+    --policy.path=${HF_USER}/act_camera_conditioned \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.cameras="{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+    --task="Pick up the cube" --duration=60
+```
+
+Live robot observations don't include extrinsics or intrinsics. When they are
+missing, ACT computes them from the current frame using `apriltag_pose` (with
+batch size 1). **Keep the AprilTag visible during rollout** and run from the
+directory that contains the calibration files.
+
+---
+
+## Known limitations / TODO
+
+- Only one AprilTag (the first one detected) defines the world frame, and lens distortion is ignored in `solvePnP`.
+- If the tag is never detected in an episode, that episode is saved with an **identity** pose and no error is raised. Check with `validate_april_tag.py`.
+- At inference, the pose is re-estimated on every step instead of once per episode.
+- `<cam>_calibration.npz` is loaded from the current working directory.
+- `generate_april_tag.py` calls `cv2.imshow`, which fails with headless OpenCV after the PNG has already been saved.
+- Calibration images, debug frames and a trained checkpoint (`src/ouputs/`, ~200 MB) are currently committed. They should probably be moved to the Hub or `.gitignore`d.
+
+## Reference
+
+- *Do You Know Where Your Camera Is? View-Invariant Policy Learning with Camera Conditioning*. Plücker-ray camera conditioning for visuomotor policies.
+- *Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware* (ACT). Zhao et al., 2023.
+
+---
+
+<a id="lerobot-upstream-readme"></a>
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>
